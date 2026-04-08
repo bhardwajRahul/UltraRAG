@@ -19,17 +19,28 @@ output/
 logs/
 test/
 corpora/
-data/chat_sessions/
-data/knowledge_base/
 # Environment variables and secrets
 .env
 
+# UI storage directories
+ui/storage/db/
+ui/storage/chat_sessions/
+ui/storage/knowledge_base/
+ui/storage/memory/
+ui/storage/ext/*
+!ui/storage/ext/.gitkeep
+
 # Example configuration files
-examples/parameter/*.yaml
-examples/server/*.yaml
+examples/experiments/parameter/*.yaml
+examples/experiments/server/*.yaml
+examples/demos/parameter/*.yaml
+examples/demos/server/*.yaml
 
 # Server configuration files for each server module
 servers/*/server.yaml
 
 # Python package metadata
 src/*.egg-info/
+
+# JavaScript frontend artifacts
+**/node_modules/

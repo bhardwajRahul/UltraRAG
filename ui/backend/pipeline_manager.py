@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import sys
@@ -20,6 +21,18 @@ import re
 import unicodedata
 import hashlib
 from datetime import datetime
+
+from .storage_paths import (
+    UI_CHAT_SESSIONS_DIR,
+    UI_MEMORY_ROOT_DIR,
+    UI_KB_ROOT_DIR,
+    UI_KB_RAW_DIR,
+    UI_KB_CORPUS_DIR,
+    UI_KB_CHUNKS_DIR,
+    UI_KB_INDEX_DIR,
+    UI_KB_CONFIG_PATH,
+    UI_MEMORY_SYNC_WORKDIR,
+)
 
 try:
     from pymilvus import MilvusClient
@@ -86,16 +99,24 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 SERVERS_DIR = PROJECT_ROOT / "servers"
-PIPELINES_DIR = PROJECT_ROOT / "examples"
-CHAT_DATASET_DIR = PROJECT_ROOT / "data" / "chat_sessions"
+PIPELINES_ROOT_DIR = PROJECT_ROOT / "examples"
+DEMO_PIPELINES_DIR = PIPELINES_ROOT_DIR / "demos"
+EXPERIMENT_PIPELINES_DIR = PIPELINES_ROOT_DIR / "experiments"
+PIPELINE_SEARCH_DIRS = (
+    DEMO_PIPELINES_DIR,
+    EXPERIMENT_PIPELINES_DIR,
+)
+CHAT_DATASET_DIR = UI_CHAT_SESSIONS_DIR
 OUTPUT_DIR = PROJECT_ROOT / "output"
+USER_MEMORY_ROOT = UI_MEMORY_ROOT_DIR
 
-KB_ROOT = PROJECT_ROOT / "data" / "knowledge_base"
-KB_RAW_DIR = KB_ROOT / "raw"
-KB_CORPUS_DIR = KB_ROOT / "corpus"
-KB_CHUNKS_DIR = KB_ROOT / "chunks"
-KB_INDEX_DIR = KB_ROOT / "index"
-KB_CONFIG_PATH = KB_ROOT / "kb_config.json"
+KB_ROOT = UI_KB_ROOT_DIR
+KB_RAW_DIR = UI_KB_RAW_DIR
+KB_CORPUS_DIR = UI_KB_CORPUS_DIR
+KB_CHUNKS_DIR = UI_KB_CHUNKS_DIR
+KB_INDEX_DIR = UI_KB_INDEX_DIR
+KB_CONFIG_PATH = UI_KB_CONFIG_PATH
+MEMORY_SYNC_WORKDIR = UI_MEMORY_SYNC_WORKDIR
 MAX_COLLECTION_NAME_LEN = 255
 
 # Default session keep-alive duration, can be overridden via environment variable;
@@ -238,10 +259,12 @@ def _extract_display_name_from_desc(desc: str, fallback: str) -> str:
 for d in [
     CHAT_DATASET_DIR,
     OUTPUT_DIR,
+    USER_MEMORY_ROOT,
     KB_RAW_DIR,
     KB_CORPUS_DIR,
     KB_CHUNKS_DIR,
     KB_INDEX_DIR,
+    MEMORY_SYNC_WORKDIR,
 ]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -277,6 +300,67 @@ def _ensure_client_funcs():
         msg = f"Missing dependency: {exc.name}"
         LOGGER.error(msg)
         raise PipelineManagerError(msg) from exc
+
+
+def _normalize_server_path(server_path: str) -> str:
+    return str(server_path or "").replace("\\", "/").rstrip("/")
+
+
+def _is_generation_server_path(server_path: str) -> bool:
+    normalized = _normalize_server_path(server_path)
+    return normalized.endswith("/generation") or normalized.endswith("/generation.py")
+
+
+def _is_retriever_server_path(server_path: str) -> bool:
+    normalized = _normalize_server_path(server_path)
+    return normalized.endswith("/retriever") or normalized.endswith("/retriever.py")
+
+
+def _server_role_from_path(server_path: Any) -> Optional[str]:
+    if not isinstance(server_path, str):
+        return None
+    if _is_generation_server_path(server_path):
+        return "generation"
+    if _is_retriever_server_path(server_path):
+        return "retriever"
+    return None
+
+
+def _resolve_generation_server_alias(pipeline_name: Optional[str]) -> str:
+    if not pipeline_name:
+        return "generation"
+    try:
+        pipeline_cfg = load_pipeline(pipeline_name)
+    except Exception:
+        return "generation"
+
+    servers = pipeline_cfg.get("servers")
+    if not isinstance(servers, dict):
+        return "generation"
+
+    for server_name, server_path in servers.items():
+        if _is_generation_server_path(str(server_path)):
+            return str(server_name)
+    return "generation"
+
+
+def _extract_non_empty_model_settings(raw_settings: Any) -> Dict[str, Dict[str, str]]:
+    result: Dict[str, Dict[str, str]] = {}
+    if not isinstance(raw_settings, dict):
+        return result
+
+    for role in ("retriever", "generation"):
+        role_payload = raw_settings.get(role)
+        if not isinstance(role_payload, dict):
+            continue
+        role_settings: Dict[str, str] = {}
+        for key in ("api_key", "base_url", "model_name"):
+            value = str(role_payload.get(key) or "").strip()
+            if value:
+                role_settings[key] = value
+        if role_settings:
+            result[role] = role_settings
+    return result
 
 
 # Session Management (Multi-Client Support)
@@ -448,6 +532,9 @@ class DemoSession:
         override_params: Dict[str, Any] = (
             dynamic_params.copy() if isinstance(dynamic_params, dict) else {}
         )
+        user_model_settings = _extract_non_empty_model_settings(
+            override_params.pop("_user_model_settings", None)
+        )
         pipeline_name = self._pipeline_name
         if not pipeline_name:
             return override_params
@@ -458,20 +545,19 @@ class DemoSession:
             LOGGER.debug("Failed to load pipeline for backend overrides: %s", exc)
             return override_params
 
+        try:
+            pipeline_params = load_parameters(pipeline_name)
+        except Exception as exc:  # pragma: no cover - best effort
+            LOGGER.debug("Failed to load parameters for backend overrides: %s", exc)
+            pipeline_params = {}
+
         servers = pipeline_cfg.get("servers")
         if not isinstance(servers, dict):
             return override_params
 
         for server_name, server_path in servers.items():
-            if not isinstance(server_path, str):
-                continue
-            is_generation = server_path == "servers/generation" or server_path.endswith(
-                "/generation"
-            )
-            is_retriever = server_path == "servers/retriever" or server_path.endswith(
-                "/retriever"
-            )
-            if not (is_generation or is_retriever):
+            role = _server_role_from_path(server_path)
+            if not role:
                 continue
 
             server_override = override_params.get(server_name)
@@ -479,6 +565,43 @@ class DemoSession:
                 server_override = {}
                 override_params[server_name] = server_override
             server_override["backend"] = "openai"
+
+            role_settings = user_model_settings.get(role)
+            if not role_settings:
+                continue
+
+            if not isinstance(pipeline_params, dict):
+                continue
+            server_params = pipeline_params.get(server_name)
+            if not isinstance(server_params, dict):
+                continue
+
+            backend_configs = server_params.get("backend_configs")
+            if not isinstance(backend_configs, dict):
+                continue
+            base_openai = backend_configs.get("openai")
+            if not isinstance(base_openai, dict):
+                continue
+
+            safe_override = {
+                key: value
+                for key, value in role_settings.items()
+                if key in base_openai and value
+            }
+            # Safety guard: only inject keys that already exist in current pipeline params.
+            if not safe_override:
+                continue
+
+            override_backend_configs = server_override.get("backend_configs")
+            if not isinstance(override_backend_configs, dict):
+                override_backend_configs = {}
+                server_override["backend_configs"] = override_backend_configs
+
+            override_openai = override_backend_configs.get("openai")
+            if not isinstance(override_openai, dict):
+                override_openai = {}
+                override_backend_configs["openai"] = override_openai
+            override_openai.update(safe_override)
 
         return override_params
 
@@ -508,8 +631,9 @@ class DemoSession:
 
         # Inject messages into generation parameters (as global variable)
         # We need to set messages before execute_pipeline
-        if "generation" not in override_params:
-            override_params["generation"] = {}
+        generation_alias = _resolve_generation_server_alias(self._pipeline_name)
+        if generation_alias not in override_params:
+            override_params[generation_alias] = {}
 
         self._current_future = asyncio.run_coroutine_threadsafe(
             funcs["exec_pipe"](
@@ -964,6 +1088,9 @@ def chat_demo_stream(
             session.add_to_history("assistant", answer)
             session.mark_first_turn_done()
 
+            # Trigger async memory->KB sync for pipelines that include memory server.
+            trigger_memory_sync_for_pipeline(session._pipeline_name, dynamic_params)
+
             # Initialize multi-turn conversation client (for subsequent turns)
             try:
                 session.init_multiturn_client()
@@ -1074,18 +1201,49 @@ def chat_multiturn_stream(
             # Get generation configuration
             # First try to get from current pipeline parameters
             pipeline_name = session._pipeline_name
+            generation_alias = _resolve_generation_server_alias(pipeline_name)
             if pipeline_name:
                 try:
                     params = load_parameters(pipeline_name)
-                    gen_params = params.get("generation", {})
+                    raw_gen_params = params.get(generation_alias)
+                    if not isinstance(raw_gen_params, dict):
+                        raw_gen_params = params.get("generation", {})
+                    gen_params = (
+                        copy.deepcopy(raw_gen_params)
+                        if isinstance(raw_gen_params, dict)
+                        else {}
+                    )
                 except Exception:
                     gen_params = {}
             else:
                 gen_params = {}
 
             # If dynamic_params has generation config, override
-            if dynamic_params and "generation" in dynamic_params:
-                gen_params.update(dynamic_params["generation"])
+            if dynamic_params:
+                dynamic_generation = dynamic_params.get(generation_alias)
+                if not isinstance(dynamic_generation, dict):
+                    dynamic_generation = dynamic_params.get("generation")
+                if isinstance(dynamic_generation, dict):
+                    gen_params.update(dynamic_generation)
+
+                model_settings = _extract_non_empty_model_settings(
+                    dynamic_params.get("_user_model_settings")
+                )
+                generation_model_settings = model_settings.get("generation", {})
+                if generation_model_settings:
+                    backend_configs = gen_params.get("backend_configs")
+                    if isinstance(backend_configs, dict):
+                        openai_cfg = backend_configs.get("openai")
+                        if isinstance(openai_cfg, dict):
+                            safe_override = {
+                                key: value
+                                for key, value in generation_model_settings.items()
+                                if key in openai_cfg and value
+                            }
+                            # Safety guard: do nothing if current generation config has no target keys.
+                            if safe_override:
+                                gen_params["backend"] = "openai"
+                                openai_cfg.update(safe_override)
 
             # Get system_prompt
             system_prompt = gen_params.get("system_prompt", "")
@@ -1142,7 +1300,7 @@ def chat_multiturn_stream(
                         {
                             "type": "token",
                             "content": token,
-                            "step": "generation.multiturn_generate",
+                            "step": f"{generation_alias}.multiturn_generate",
                             "is_final": True,
                         }
                     )
@@ -1166,6 +1324,13 @@ def chat_multiturn_stream(
                         else f"Generated:\n{full_content}"
                     ),
                 }
+            )
+
+            _auto_save_memory_chat_turn(
+                session,
+                question,
+                full_content,
+                dynamic_params,
             )
 
             # Update conversation history
@@ -1300,6 +1465,667 @@ def _find_memory_answer(name: str, before: set[str]):
     return None, target
 
 
+_MEMORY_SYNC_LOCKS: Dict[str, threading.Lock] = {}
+_MEMORY_SYNC_LOCKS_GUARD = threading.Lock()
+
+
+def _get_memory_sync_lock(user_id: str) -> threading.Lock:
+    with _MEMORY_SYNC_LOCKS_GUARD:
+        if user_id not in _MEMORY_SYNC_LOCKS:
+            _MEMORY_SYNC_LOCKS[user_id] = threading.Lock()
+        return _MEMORY_SYNC_LOCKS[user_id]
+
+
+def get_memory_collection_name(user_id: Optional[str]) -> str:
+    normalized_user_id = _normalize_memory_user_id(user_id)
+    collection_name = _normalize_collection_name(f"user_{normalized_user_id}")
+    if collection_name:
+        return collection_name
+    return f"user_{normalized_user_id}".replace("-", "_")
+
+
+def pipeline_uses_memory_retrieval(pipeline_name: Optional[str]) -> bool:
+    if not pipeline_name:
+        return False
+    try:
+        pipeline_cfg = load_pipeline(pipeline_name)
+    except Exception:
+        return False
+
+    servers = pipeline_cfg.get("servers", {})
+    if not isinstance(servers, dict):
+        return False
+
+    memory_aliases: set[str] = set()
+    retriever_aliases: set[str] = set()
+    for alias, server_path in servers.items():
+        if not isinstance(server_path, str):
+            continue
+        normalized = server_path.replace("\\", "/").rstrip("/")
+        if normalized == "servers/memory" or normalized.endswith("/memory"):
+            memory_aliases.add(alias)
+        if normalized == "servers/retriever" or normalized.endswith("/retriever"):
+            retriever_aliases.add(alias)
+
+    if not memory_aliases or not retriever_aliases:
+        return False
+
+    retrieval_tools = {
+        "retriever_search",
+        "retriever_batch_search",
+        "retriever_websearch",
+        "retriever_deploy_search",
+        "bm25_search",
+    }
+
+    def _scan_steps(steps: Any) -> bool:
+        if isinstance(steps, list):
+            return any(_scan_steps(item) for item in steps)
+        if isinstance(steps, str):
+            if "." not in steps:
+                return False
+            server_name, tool_name = steps.split(".", 1)
+            return server_name in retriever_aliases and tool_name in retrieval_tools
+        if isinstance(steps, dict):
+            if "loop" in steps:
+                return _scan_steps(steps.get("loop", {}).get("steps", []))
+            if "branch" in steps:
+                branch_cfg = steps.get("branch", {})
+                if _scan_steps(branch_cfg.get("router", [])):
+                    return True
+                for branch_steps in branch_cfg.get("branches", {}).values():
+                    if _scan_steps(branch_steps):
+                        return True
+                return False
+            if len(steps) == 1:
+                step_name = next(iter(steps.keys()))
+                if isinstance(step_name, str) and "." in step_name:
+                    server_name, tool_name = step_name.split(".", 1)
+                    return (
+                        server_name in retriever_aliases and tool_name in retrieval_tools
+                    )
+            return False
+        return False
+
+    return _scan_steps(pipeline_cfg.get("pipeline", []))
+
+
+def _memory_sync_state_path(user_id: str) -> Path:
+    return USER_MEMORY_ROOT / user_id / ".project_sync_state.json"
+
+
+def _load_memory_sync_state(user_id: str) -> Dict[str, Any]:
+    state_path = _memory_sync_state_path(user_id)
+    if not state_path.exists():
+        return {"files": {}}
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception as exc:
+        LOGGER.warning("Failed to load memory sync state for %s: %s", user_id, exc)
+    return {"files": {}}
+
+
+def _save_memory_sync_state(user_id: str, state: Dict[str, Any]) -> None:
+    state_path = _memory_sync_state_path(user_id)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _list_project_memory_files(user_id: str) -> List[Path]:
+    project_dir = USER_MEMORY_ROOT / user_id / "project"
+    if not project_dir.exists():
+        return []
+    return sorted(
+        [p for p in project_dir.glob("*.md") if p.is_file()],
+        key=lambda p: p.name,
+    )
+
+
+def _snapshot_project_memory_files(user_id: str, files: List[Path]) -> Dict[str, Any]:
+    user_root = USER_MEMORY_ROOT / user_id
+    file_state: Dict[str, Any] = {}
+    for path in files:
+        rel_path = str(path.relative_to(user_root))
+        stat = path.stat()
+        file_state[rel_path] = {
+            "size": int(stat.st_size),
+            "mtime": int(stat.st_mtime),
+        }
+    return file_state
+
+
+_MEMORY_TURN_HEADER_PATTERN = re.compile(
+    r"(?m)^##\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*$"
+)
+
+
+def _parse_project_memory_turn_chunks(
+    markdown_text: str,
+    source_rel_path: str,
+) -> List[Dict[str, str]]:
+    """Split project memory markdown into per-turn chunks based on timestamp headings."""
+    text = str(markdown_text or "")
+    matches = list(_MEMORY_TURN_HEADER_PATTERN.finditer(text))
+    chunks: List[Dict[str, str]] = []
+    if not matches:
+        return chunks
+
+    for idx, match in enumerate(matches):
+        turn_time = match.group(1).strip()
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        block = text[start:end].strip()
+        if not block:
+            continue
+
+        chunk_id = hashlib.sha256(
+            f"{source_rel_path}|{turn_time}|{block}".encode("utf-8")
+        ).hexdigest()
+        chunks.append(
+            {
+                "chunk_id": chunk_id,
+                "turn_time": turn_time,
+                "source_file": source_rel_path,
+                "contents": block,
+            }
+        )
+    return chunks
+
+
+def _dedupe_turn_chunks(chunks: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    seen: set[str] = set()
+    deduped: List[Dict[str, str]] = []
+    for chunk in chunks:
+        chunk_id = str(chunk.get("chunk_id", ""))
+        if not chunk_id or chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        deduped.append(chunk)
+    return deduped
+
+
+def _write_turn_chunks_jsonl(
+    output_path: Path,
+    chunks: List[Dict[str, str]],
+    user_id: str,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        for idx, chunk in enumerate(chunks):
+            payload = {
+                "id": chunk.get("chunk_id"),
+                "contents": chunk.get("contents", ""),
+                "source_file": chunk.get("source_file", ""),
+                "turn_time": chunk.get("turn_time", ""),
+                "chunk_type": "project_memory_turn",
+                "chunk_order": idx,
+                "user_id": user_id,
+            }
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def sync_user_memory_to_kb(
+    user_id: Optional[str],
+    mode: str = "append",
+    progress_callback: Optional[Any] = None,
+    force_full: bool = False,
+) -> Dict[str, Any]:
+    """Sync a user's project memory markdown files into per-user KB collection."""
+
+    def _report_progress(progress: int, message: str = "") -> None:
+        if progress_callback:
+            try:
+                progress_callback(progress, message)
+            except Exception as exc:
+                LOGGER.warning("Memory sync progress callback failed: %s", exc)
+
+    normalized_user_id = _normalize_memory_user_id(user_id)
+    lock = _get_memory_sync_lock(normalized_user_id)
+    if not lock.acquire(blocking=False):
+        return {
+            "status": "running",
+            "user_id": normalized_user_id,
+            "collection_name": get_memory_collection_name(normalized_user_id),
+            "message": "Sync already in progress",
+        }
+
+    run_dir: Optional[Path] = None
+    try:
+        _report_progress(5, "Preparing memory sync context...")
+        memory_files = _list_project_memory_files(normalized_user_id)
+        if not memory_files:
+            return {
+                "status": "skipped",
+                "user_id": normalized_user_id,
+                "collection_name": get_memory_collection_name(normalized_user_id),
+                "message": "No project memory files found",
+            }
+
+        now_ts = int(time.time() * 1000)
+        run_dir = (
+            MEMORY_SYNC_WORKDIR
+            / normalized_user_id
+            / f"run_{now_ts}_{uuid.uuid4().hex[:8]}"
+        )
+        source_dir = run_dir / "source"
+        for d in [source_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        state = _load_memory_sync_state(normalized_user_id)
+        raw_previous_files = state.get("files", {}) if isinstance(state, dict) else {}
+        previous_files = raw_previous_files if isinstance(raw_previous_files, dict) else {}
+        user_root = USER_MEMORY_ROOT / normalized_user_id
+
+        full_rebuild = bool(force_full or mode == "overwrite")
+        turn_chunks: List[Dict[str, str]] = []
+        current_rel_paths: set[str] = set()
+
+        _report_progress(12, "Scanning project memory turns...")
+        for file_path in memory_files:
+            rel_path = str(file_path.relative_to(user_root))
+            current_rel_paths.add(rel_path)
+            cur_size = int(file_path.stat().st_size)
+            prev_size = int(previous_files.get(rel_path, {}).get("size", 0) or 0)
+
+            if prev_size > cur_size:
+                full_rebuild = True
+                break
+
+            if cur_size == prev_size:
+                continue
+
+            with file_path.open("rb") as f:
+                f.seek(max(prev_size, 0))
+                raw_delta = f.read()
+
+            delta_text = raw_delta.decode("utf-8", errors="ignore")
+            if not delta_text.strip():
+                continue
+
+            delta_chunks = _parse_project_memory_turn_chunks(delta_text, rel_path)
+            if delta_text.strip() and not delta_chunks:
+                # Delta does not align with turn boundaries; fallback to a full rebuild.
+                full_rebuild = True
+                break
+            turn_chunks.extend(delta_chunks)
+
+        if not full_rebuild:
+            removed_paths = set(previous_files.keys()) - current_rel_paths
+            if removed_paths:
+                full_rebuild = True
+
+        if full_rebuild:
+            _report_progress(18, "Building full turn-level snapshot for reindex...")
+            turn_chunks = []
+            for file_path in memory_files:
+                rel_path = str(file_path.relative_to(user_root))
+                try:
+                    content = file_path.read_text(encoding="utf-8")
+                except Exception:
+                    content = file_path.read_text(encoding="utf-8", errors="ignore")
+                if not content.strip():
+                    continue
+                turn_chunks.extend(_parse_project_memory_turn_chunks(content, rel_path))
+
+            if not turn_chunks:
+                return {
+                    "status": "skipped",
+                    "user_id": normalized_user_id,
+                    "collection_name": get_memory_collection_name(normalized_user_id),
+                    "message": "No project memory turns to index",
+                }
+
+        turn_chunks = _dedupe_turn_chunks(turn_chunks)
+        if not turn_chunks:
+            _save_memory_sync_state(
+                normalized_user_id,
+                {
+                    "updated_at": datetime.now().isoformat(),
+                    "files": _snapshot_project_memory_files(
+                        normalized_user_id, memory_files
+                    ),
+                    "collection_name": get_memory_collection_name(normalized_user_id),
+                },
+            )
+            return {
+                "status": "skipped",
+                "user_id": normalized_user_id,
+                "collection_name": get_memory_collection_name(normalized_user_id),
+                "message": "No new project memory turns",
+            }
+
+        collection_name = get_memory_collection_name(normalized_user_id)
+        run_mode = "overwrite" if full_rebuild else "append"
+        chunk_file = source_dir / f"memory_turn_chunks_{now_ts}.jsonl"
+        _write_turn_chunks_jsonl(chunk_file, turn_chunks, normalized_user_id)
+        _report_progress(45, f"Prepared {len(turn_chunks)} turn chunks")
+
+        # Use examples/milvus_index.yaml pipeline for indexing.
+        run_kb_pipeline_tool(
+            pipeline_name="milvus_index",
+            target_file_path=str(chunk_file),
+            output_dir="",
+            collection_name=collection_name,
+            index_mode=run_mode,
+        )
+        _report_progress(85, "Indexed turn chunks to Milvus")
+
+        _save_memory_sync_state(
+            normalized_user_id,
+            {
+                "updated_at": datetime.now().isoformat(),
+                "files": _snapshot_project_memory_files(normalized_user_id, memory_files),
+                "collection_name": collection_name,
+            },
+        )
+        _report_progress(100, "Memory sync completed")
+        return {
+            "status": "success",
+            "user_id": normalized_user_id,
+            "collection_name": collection_name,
+            "full_rebuild": full_rebuild,
+            "indexed_chunks": len(turn_chunks),
+            "index_mode": run_mode,
+        }
+    finally:
+        if run_dir and run_dir.exists():
+            shutil.rmtree(run_dir, ignore_errors=True)
+        lock.release()
+
+
+def _get_collection_row_count(client: Any, collection_name: str) -> int:
+    try:
+        stats = client.get_collection_stats(collection_name)
+        value = stats.get("row_count", 0)
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def clear_user_memory_collection_vectors(user_id: Optional[str]) -> Dict[str, Any]:
+    normalized_user_id = _normalize_memory_user_id(user_id)
+    collection_name = get_memory_collection_name(normalized_user_id)
+    lock = _get_memory_sync_lock(normalized_user_id)
+    if not lock.acquire(blocking=False):
+        return {
+            "status": "running",
+            "user_id": normalized_user_id,
+            "collection_name": collection_name,
+            "message": "Memory sync is running. Please retry later.",
+        }
+
+    client = None
+    try:
+        client = _get_milvus_client()
+        before_count = 0
+        if client.has_collection(collection_name):
+            before_count = _get_collection_row_count(client, collection_name)
+            # Drop collection instead of row-by-row delete to avoid stale row_count.
+            client.drop_collection(collection_name)
+            LOGGER.info(
+                "Dropped memory collection for user %s: %s",
+                normalized_user_id,
+                collection_name,
+            )
+
+        # Also clear user working-memory project files so next sync starts clean.
+        # Keep global MEMORY.md untouched.
+        removed_files = 0
+        user_root = USER_MEMORY_ROOT / normalized_user_id
+        project_dir = user_root / "project"
+        if project_dir.exists():
+            for p in project_dir.glob("*.md"):
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+                    removed_files += 1
+            shutil.rmtree(project_dir, ignore_errors=True)
+
+        sync_state_path = _memory_sync_state_path(normalized_user_id)
+        if sync_state_path.exists():
+            sync_state_path.unlink(missing_ok=True)
+
+        try:
+            if user_root.exists() and not any(user_root.iterdir()):
+                user_root.rmdir()
+        except Exception:
+            # Best effort cleanup, safe to ignore.
+            pass
+
+        return {
+            "status": "success",
+            "user_id": normalized_user_id,
+            "collection_name": collection_name,
+            "cleared_count": before_count,
+            "remaining_count": 0,
+            "removed_memory_files": removed_files,
+        }
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:
+                LOGGER.debug("Failed to close Milvus client for user %s: %s", normalized_user_id, exc)
+        lock.release()
+
+
+def _trigger_memory_sync_async(user_id: str) -> None:
+    normalized_user_id = _normalize_memory_user_id(user_id)
+
+    def _run() -> None:
+        try:
+            result = sync_user_memory_to_kb(normalized_user_id, mode="append")
+            LOGGER.info("Auto memory sync result for %s: %s", normalized_user_id, result)
+        except Exception as exc:
+            LOGGER.warning("Auto memory sync failed for %s: %s", normalized_user_id, exc)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _resolve_memory_server_alias_from_session(
+    session: Optional[DemoSession],
+) -> Optional[str]:
+    if not session:
+        return None
+
+    context = getattr(session, "_context", None)
+    if not isinstance(context, dict):
+        return None
+
+    server_cfg = context.get("server_cfg", {})
+    if not isinstance(server_cfg, dict):
+        return None
+
+    for alias, cfg in server_cfg.items():
+        if not isinstance(cfg, dict):
+            continue
+        path = str(cfg.get("path", "")).replace("\\", "/").rstrip("/")
+        if path and "servers/memory/" in path and path.endswith("/memory.py"):
+            return alias
+    return None
+
+
+def _resolve_memory_server_alias(pipeline_name: Optional[str]) -> Optional[str]:
+    if not pipeline_name:
+        return None
+    try:
+        pipeline_cfg = load_pipeline(pipeline_name)
+    except Exception:
+        return None
+
+    servers = pipeline_cfg.get("servers", {})
+    if not isinstance(servers, dict):
+        return None
+
+    for alias, server_path in servers.items():
+        if not isinstance(server_path, str):
+            continue
+        normalized = server_path.replace("\\", "/").rstrip("/")
+        if normalized == "servers/memory" or normalized.endswith("/memory"):
+            return alias
+    return None
+
+
+def _resolve_memory_user_id(
+    pipeline_name: Optional[str],
+    memory_alias: str,
+    dynamic_params: Optional[Dict[str, Any]] = None,
+) -> str:
+    user_id = "default"
+    if pipeline_name:
+        try:
+            params = load_parameters(pipeline_name)
+            memory_params = params.get(memory_alias, {})
+            if isinstance(memory_params, dict) and "user_id" in memory_params:
+                candidate = str(memory_params.get("user_id", "")).strip()
+                if candidate:
+                    user_id = candidate
+        except Exception as exc:
+            LOGGER.debug("Failed to resolve memory user_id from params: %s", exc)
+
+    if dynamic_params:
+        memory_override = dynamic_params.get(memory_alias)
+        if isinstance(memory_override, dict) and "user_id" in memory_override:
+            candidate = str(memory_override.get("user_id", "")).strip()
+            if candidate:
+                user_id = candidate
+        common_memory_override = dynamic_params.get("memory")
+        if isinstance(common_memory_override, dict) and "user_id" in common_memory_override:
+            candidate = str(common_memory_override.get("user_id", "")).strip()
+            if candidate:
+                user_id = candidate
+
+    return user_id
+
+
+def resolve_memory_collection_for_pipeline(
+    pipeline_name: Optional[str],
+    dynamic_params: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, str]]:
+    if not pipeline_uses_memory_retrieval(pipeline_name):
+        return None
+
+    memory_alias = _resolve_memory_server_alias(pipeline_name)
+    if not memory_alias:
+        return None
+
+    user_id = _resolve_memory_user_id(pipeline_name, memory_alias, dynamic_params)
+    return {
+        "user_id": user_id,
+        "collection_name": get_memory_collection_name(user_id),
+    }
+
+
+def trigger_memory_sync_for_pipeline(
+    pipeline_name: Optional[str],
+    dynamic_params: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, str]]:
+    if not pipeline_name:
+        return None
+    memory_alias = _resolve_memory_server_alias(pipeline_name)
+    if not memory_alias:
+        return None
+    user_id = _resolve_memory_user_id(pipeline_name, memory_alias, dynamic_params)
+    _trigger_memory_sync_async(user_id)
+    return {"user_id": user_id}
+
+
+def _normalize_memory_user_id(user_id: Optional[str]) -> str:
+    normalized = str(user_id or "default").strip() or "default"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+$", normalized):
+        return "default"
+    return normalized
+
+
+def _write_memory_locally(user_id: str, question: str, answer: str) -> None:
+    normalized_user_id = _normalize_memory_user_id(user_id)
+    user_dir = USER_MEMORY_ROOT / normalized_user_id
+    project_dir = user_dir / "project"
+    memory_file = user_dir / "MEMORY.md"
+
+    project_dir.mkdir(parents=True, exist_ok=True)
+    if not memory_file.exists():
+        memory_file.write_text("# MEMORY\ni am jack. i like LLMs.\n", encoding="utf-8")
+
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+    daily_file = project_dir / f"{date_str}.md"
+    entry = (
+        f"\n## {date_str} {time_str}\n"
+        f"- user: {str(question).strip()}\n"
+        f"- assistant: {str(answer).strip()}\n"
+    )
+
+    if not daily_file.exists():
+        daily_file.write_text(f"# Project Memory {date_str}\n{entry}", encoding="utf-8")
+    else:
+        with daily_file.open("a", encoding="utf-8") as f:
+            f.write(entry)
+
+
+def _auto_save_memory_chat_turn(
+    session: Optional[DemoSession],
+    question: str,
+    answer: str,
+    dynamic_params: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not session or not question or not answer:
+        return
+
+    pipeline_name = getattr(session, "_pipeline_name", None)
+    memory_alias = _resolve_memory_server_alias_from_session(
+        session
+    ) or _resolve_memory_server_alias(pipeline_name)
+    if not memory_alias:
+        return
+
+    user_id = _resolve_memory_user_id(pipeline_name, memory_alias, dynamic_params)
+    payload = {"user_id": user_id, "q_ls": [question], "ans_ls": [answer]}
+
+    context = getattr(session, "_context", None)
+    server_cfg = context.get("server_cfg", {}) if isinstance(context, dict) else {}
+    is_multi_server = isinstance(server_cfg, dict) and len(server_cfg.keys()) > 1
+    save_tool_name = f"{memory_alias}_save_memory" if is_multi_server else "save_memory"
+
+    client_obj = getattr(session, "_client", None)
+    loop_obj = getattr(session, "_loop", None)
+    if getattr(session, "_active", False) and client_obj and loop_obj:
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                client_obj.call_tool(save_tool_name, payload),
+                loop_obj,
+            )
+            future.result(timeout=15)
+            LOGGER.info(
+                "Auto-saved memory via MCP tool=%s input=q_ls pipeline=%s user_id=%s",
+                save_tool_name,
+                pipeline_name,
+                user_id,
+            )
+            _trigger_memory_sync_async(user_id)
+            return
+        except Exception as exc:
+            LOGGER.warning(
+                "Auto memory save via MCP failed, fallback to local write: %s", exc
+            )
+
+    try:
+        _write_memory_locally(user_id, question, answer)
+        LOGGER.info(
+            "Auto-saved memory via local writer for pipeline=%s user_id=%s",
+            pipeline_name,
+            user_id,
+        )
+        _trigger_memory_sync_async(user_id)
+    except Exception as exc:
+        LOGGER.warning("Auto memory save failed in multiturn chat: %s", exc)
+
+
 def _as_project_relative(path: Path) -> str:
     try:
         return path.relative_to(PROJECT_ROOT).as_posix()
@@ -1307,21 +2133,44 @@ def _as_project_relative(path: Path) -> str:
         return path.as_posix()
 
 
+def _sanitize_pipeline_name(name: str) -> str:
+    return str(name or "").replace("..", "_").strip()
+
+
+def _is_demo_pipeline_name(name: str) -> bool:
+    return any(ch.isupper() for ch in name)
+
+
+def _default_pipeline_dir(name: str) -> Path:
+    return DEMO_PIPELINES_DIR if _is_demo_pipeline_name(name) else EXPERIMENT_PIPELINES_DIR
+
+
+def _pipeline_candidates(name: str) -> List[Path]:
+    safe_name = _sanitize_pipeline_name(name)
+    filename = f"{safe_name}.yaml"
+    preferred_dir = _default_pipeline_dir(safe_name)
+    ordered_dirs = [preferred_dir]
+    for directory in PIPELINE_SEARCH_DIRS:
+        if directory not in ordered_dirs:
+            ordered_dirs.append(directory)
+    return [directory / filename for directory in ordered_dirs]
+
+
 def pipeline_path(name: str) -> Path:
-    return PIPELINES_DIR / f"{name.replace('..','_')}.yaml"
+    safe_name = _sanitize_pipeline_name(name)
+    return _default_pipeline_dir(safe_name) / f"{safe_name}.yaml"
 
 
 def _find_pipeline_file(name: str) -> Path | None:
-    p = pipeline_path(name)
-    return p if p.exists() else None
+    for candidate in _pipeline_candidates(name):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _parameter_candidates(config_file: Path) -> List[Path]:
     base = config_file.stem
-    return [
-        config_file.parent / "parameter" / f"{base}_parameter.yaml",
-        PIPELINES_DIR / "parameter" / f"{base}_parameter.yaml",
-    ]
+    return [config_file.parent / "parameter" / f"{base}_parameter.yaml"]
 
 
 def _resolve_parameter_path(name: str, *, for_write: bool = False) -> Path:
@@ -1329,13 +2178,9 @@ def _resolve_parameter_path(name: str, *, for_write: bool = False) -> Path:
     if not cfg:
         raise PipelineManagerError("Pipeline not found")
     cands = _parameter_candidates(cfg)
-    if not for_write:
-        for c in cands:
-            if c.exists():
-                return c
-    for c in cands:
-        if c.parent.exists() or for_write:
-            return c
+    for candidate in cands:
+        if candidate.exists():
+            return candidate
     return cands[0]
 
 
@@ -1376,28 +2221,24 @@ HIDDEN_PIPELINES = {
 
 def list_pipelines() -> List[Dict[str, Any]]:
     res = []
-    if PIPELINES_DIR.exists():
-        for f in PIPELINES_DIR.glob("*.yaml"):
+    if DEMO_PIPELINES_DIR.exists():
+        for f in sorted(DEMO_PIPELINES_DIR.glob("*.yaml")):
             # Skip pipelines in hidden list
             if f.stem in HIDDEN_PIPELINES:
                 continue
 
-            if not any(r["name"] == f.stem for r in res):
+            # UI only displays demo pipelines that are already built.
+            param_path = f.parent / "parameter" / f"{f.stem}_parameter.yaml"
+            if not param_path.exists():
+                continue
 
-                param_path = PIPELINES_DIR / "parameter" / f"{f.stem}_parameter.yaml"
-                if not param_path.exists():
-                    param_path = f.parent / "parameter" / f"{f.stem}_parameter.yaml"
-
-                is_ready = param_path.exists()
-
-                res.append(
-                    {
-                        "name": f.stem,
-                        "config": yaml.safe_load(f.read_text(encoding="utf-8"))
-                        or {},
-                        "is_ready": is_ready,
-                    }
-                )
+            res.append(
+                {
+                    "name": f.stem,
+                    "config": yaml.safe_load(f.read_text(encoding="utf-8")) or {},
+                    "is_ready": True,
+                }
+            )
     return res
 
 
@@ -1465,7 +2306,9 @@ def save_pipeline(payload: Dict) -> Dict:
         "pipeline": steps,
     }
 
-    with pipeline_path(name).open("w", encoding="utf-8") as f:
+    output_path = pipeline_path(name)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(yaml_data, f, sort_keys=False, allow_unicode=True)
 
     return {"name": name, **yaml_data}
@@ -1495,6 +2338,7 @@ def save_pipeline_yaml(name: str, yaml_content: str) -> Dict:
 
     # Write file
     p = pipeline_path(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(yaml_content, encoding="utf-8")
 
     return {"name": name, "status": "saved"}
@@ -1527,18 +2371,20 @@ def rename_pipeline(old_name: str, new_name: str) -> Dict:
     if not old_path:
         raise PipelineManagerError(f"Pipeline '{old_name}' not found")
 
-    # Check if new name already exists
-    new_path = pipeline_path(new_name)
-    if new_path.exists():
+    # Check if new name already exists in any known pipeline directory
+    if _find_pipeline_file(new_name):
         raise PipelineManagerError(f"Pipeline '{new_name}' already exists")
+
+    new_path = pipeline_path(new_name)
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    old_param_path = old_path.parent / "parameter" / f"{old_path.stem}_parameter.yaml"
+    new_param_path = new_path.parent / "parameter" / f"{new_path.stem}_parameter.yaml"
 
     # Execute rename
     old_path.rename(new_path)
 
     # Also rename corresponding parameter file (if exists)
-    old_param_path = _resolve_parameter_path(old_name, for_write=False)
     if old_param_path.exists():
-        new_param_path = _resolve_parameter_path(new_name, for_write=True)
         new_param_path.parent.mkdir(parents=True, exist_ok=True)
         old_param_path.rename(new_param_path)
 
@@ -1932,6 +2778,9 @@ def run_background_chat(
             mem_ans, mem_file = _find_memory_answer(name, before_memory)
 
             answer = final_ans or mem_ans or "No answer generated"
+
+            # Trigger async memory->KB sync for memory-enabled pipelines.
+            trigger_memory_sync_for_pipeline(bg_session._pipeline_name, dynamic_params)
 
             # Update task to completed status
             BACKGROUND_TASK_MANAGER.update_task(
@@ -2563,6 +3412,8 @@ def run_kb_pipeline_tool(
     target_file = Path(target_file_path)
     stem = target_file.stem
     override_params = {}
+    resolved_collection_name: Optional[str] = None
+    resolved_collection_display_name: Optional[str] = None
 
     # [New] Get source file's display_name to pass to output
     source_display_name = None
@@ -2670,6 +3521,9 @@ def run_kb_pipeline_tool(
                 requested_name, existing_display_name_values
             )
 
+        resolved_collection_name = safe_collection_name
+        resolved_collection_display_name = display_collection_name
+
         is_overwrite = index_mode == "overwrite"
 
         full_kb_cfg = load_kb_config()
@@ -2765,7 +3619,12 @@ def run_kb_pipeline_tool(
             loop.close()
 
         _report_progress(100, "Completed")
-        return {"status": "success", "result": _extract_result(raw_result)}
+        payload: Dict[str, Any] = {"status": "success", "result": _extract_result(raw_result)}
+        if resolved_collection_name:
+            payload["collection_name"] = resolved_collection_name
+        if resolved_collection_display_name:
+            payload["collection_display_name"] = resolved_collection_display_name
+        return payload
 
     except Exception as e:
         LOGGER.error(f"KB Task Failed: {e}")

@@ -1,3 +1,11 @@
+FROM node:22-bookworm-slim AS frontend-builder
+
+WORKDIR /ultrarag-frontend
+COPY ui/frontend/package*.json ./
+RUN npm ci
+COPY ui/frontend/ ./
+RUN npm run build
+
 FROM nvidia/cuda:13.1.1-base-ubuntu24.04
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -18,9 +26,10 @@ RUN apt-get update && \
 
 WORKDIR /ultrarag
 COPY . .
+COPY --from=frontend-builder /ultrarag-frontend/dist ./ui/frontend/dist
 
 RUN uv sync --frozen --no-dev --all-extras
 
 EXPOSE 5050
 
-CMD ["ultrarag", "show", "ui", "--admin", "--port", "5050", "--host", "0.0.0.0"]
+CMD ["ultrarag", "show", "ui", "--port", "5050", "--host", "0.0.0.0"]

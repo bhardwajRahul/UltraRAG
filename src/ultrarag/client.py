@@ -53,16 +53,12 @@ class MockResult:
         self.data = text_content
 
 
-def launch_ui(
-    host: str = "127.0.0.1", port: int = 5050, admin_mode: bool = False
-) -> None:
+def launch_ui(host: str = "127.0.0.1", port: int = 5050) -> None:
     """Launch UltraRAG UI server.
 
     Args:
         host: Server host address (default: "127.0.0.1")
         port: Server port (default: 5050)
-        admin_mode: Whether to run in admin mode (default: False)
-
     Raises:
         RuntimeError: If UI backend cannot be loaded or server fails to start
     """
@@ -78,10 +74,9 @@ def launch_ui(
             "Please ensure the `ui/backend` directory exists and is importable."
         ) from exc
 
-    app = create_app(admin_mode=admin_mode)
+    app = create_app(admin_mode=True)
     ui_logger = logging.getLogger("UltraRAG-UI")
-    mode_str = "Admin" if admin_mode else "Chat"
-    ui_logger.info("UltraRAG UI (%s mode) started: http://%s:%d", mode_str, host, port)
+    ui_logger.info("UltraRAG UI started: http://%s:%d", host, port)
 
     try:
         app.run(host=host, port=port, debug=False)
@@ -1409,6 +1404,149 @@ async def execute_pipeline(
                 Data.local_vals[srv_name].update(params)
                 logger.info(f"Dynamic Override applied for '{srv_name}': {params}")
 
+    memory_save_aliases: List[str] = []
+    for srv_name, srv_conf in server_cfg.items():
+        if not isinstance(srv_conf, dict):
+            continue
+        srv_path = str(srv_conf.get("path", "")).replace("\\", "/").rstrip("/")
+        has_declared_save_tool = isinstance(srv_conf.get("tools"), dict) and (
+            "save_memory" in srv_conf.get("tools", {})
+        )
+        is_memory_server = (
+            srv_path.endswith("/memory.py")
+            and "/servers/memory/" in f"/{srv_path}/"
+        )
+        if has_declared_save_tool or is_memory_server:
+            memory_save_aliases.append(srv_name)
+
+    def _is_memory_save_step(step: PipelineStep) -> bool:
+        if not memory_save_aliases:
+            return False
+
+        step_name = None
+        if isinstance(step, str):
+            step_name = step
+        elif isinstance(step, dict) and len(step) > 0:
+            step_name = list(step.keys())[0]
+
+        if not step_name or "." not in step_name:
+            return False
+
+        srv_name, tool_name = step_name.split(".", 1)
+        return srv_name in memory_save_aliases and tool_name == "save_memory"
+
+    def _unwrap_branch_data(value: Any) -> Any:
+        if (
+            isinstance(value, list)
+            and value
+            and isinstance(value[0], dict)
+            and "data" in value[0]
+        ):
+            return [
+                item.get("data")
+                for item in value
+                if isinstance(item, dict)
+                and "data" in item
+                and item.get("data") is not UNSET
+            ]
+        return value
+
+    def _extract_text_from_message_like(item: Any) -> str:
+        if item is None:
+            return ""
+        if isinstance(item, str):
+            return item.strip()
+        if isinstance(item, dict):
+            content_val = item.get("content")
+            if isinstance(content_val, dict) and "text" in content_val:
+                return str(content_val["text"]).strip()
+            if isinstance(content_val, str):
+                return content_val.strip()
+            if "text" in item:
+                return str(item["text"]).strip()
+
+        content_obj = getattr(item, "content", None)
+        if content_obj is not None:
+            text_val = getattr(content_obj, "text", None)
+            if text_val is not None:
+                return str(text_val).strip()
+        if hasattr(item, "text"):
+            return str(getattr(item, "text")).strip()
+        return str(item).strip()
+
+    def _extract_first_answer_text(result_obj: Any) -> Optional[str]:
+        payload: Any = None
+        if hasattr(result_obj, "content") and result_obj.content:
+            payload = result_obj.content[0].text
+        elif hasattr(result_obj, "data"):
+            payload = result_obj.data
+        else:
+            payload = result_obj
+
+        if payload is None:
+            return None
+
+        if isinstance(payload, dict):
+            parsed = payload
+        elif isinstance(payload, str):
+            try:
+                parsed = json.loads(payload)
+            except Exception:
+                stripped = payload.strip()
+                return stripped if stripped else None
+        else:
+            return str(payload)
+
+        ans_ls = parsed.get("ans_ls") if isinstance(parsed, dict) else None
+        if isinstance(ans_ls, list) and ans_ls:
+            answer = ans_ls[0]
+            if answer is None:
+                return None
+            return str(answer).strip() or None
+        return None
+
+    async def _auto_save_memory_turn(result_obj: Any) -> None:
+        if not memory_save_aliases:
+            return
+
+        memory_srv = memory_save_aliases[0]
+        memory_params = Data.local_vals.get(memory_srv, {})
+        user_id = str(memory_params.get("user_id", "default")).strip() or "default"
+
+        question_ls: List[str] = []
+        q_candidate = _unwrap_branch_data(Data.global_vars.get("q_ls"))
+        if isinstance(q_candidate, list) and q_candidate:
+            parsed_questions = [
+                _extract_text_from_message_like(item) for item in q_candidate
+            ]
+            question_ls = [q for q in parsed_questions if q]
+
+        ans_ls_raw = _unwrap_branch_data(Data.global_vars.get("ans_ls"))
+        if isinstance(ans_ls_raw, list) and ans_ls_raw:
+            first_ans = ans_ls_raw[0]
+            ans_text = str(first_ans).strip() if first_ans is not None else ""
+        else:
+            extracted_ans = _extract_first_answer_text(result_obj)
+            ans_text = extracted_ans.strip() if extracted_ans else ""
+
+        if not question_ls or not ans_text:
+            logger.debug(
+                "Skip auto memory save: prompt or answer missing (prompt_len=%s, ans_exists=%s)",
+                len(question_ls),
+                bool(ans_text),
+            )
+            return
+
+        save_tool = (
+            f"{memory_srv}_save_memory" if len(server_cfg.keys()) > 1 else "save_memory"
+        )
+        payload = {"user_id": user_id, "q_ls": [question_ls[0]], "ans_ls": [ans_text]}
+        try:
+            await client.call_tool(save_tool, payload)
+            logger.info("Auto-saved memory with %s (input=q_ls).", save_tool)
+        except Exception as exc:
+            logger.warning("Auto memory save failed (%s): %s", save_tool, exc)
+
     generation_services_map = {}
     retriever_aliases = set()
 
@@ -1464,7 +1602,18 @@ async def execute_pipeline(
             else:
                 current_step_name = "Unknown"
 
-            is_final_step = depth == 0 and idx == len(steps) - 1
+            if _is_memory_save_step(step):
+                logger.debug(
+                    "%sSkipping explicit save_memory step %s (auto-saved after pipeline).",
+                    indent,
+                    current_step_name,
+                )
+                continue
+
+            is_final_step = depth == 0 and not any(
+                not _is_memory_save_step(remain_step)
+                for remain_step in steps[idx + 1 :]
+            )
 
             if stream_callback:
                 await stream_callback(
@@ -1907,6 +2056,8 @@ async def execute_pipeline(
                     f"Cleanup tool {tool_name} raised {exc.__class__.__name__}: {exc}"
                 )
 
+    await _auto_save_memory_turn(result)
+
     # save memory snapshots
     Data.write_memory_output(cfg_name, datetime.now().strftime("%Y%m%d_%H%M%S"))
 
@@ -2009,11 +2160,6 @@ def main() -> None:
     p_show_ui = show_sub.add_parser("ui", help="Launch the UltraRAG web UI")
     p_show_ui.add_argument("--host", default="127.0.0.1")
     p_show_ui.add_argument("--port", type=int, default=5050)
-    p_show_ui.add_argument(
-        "--admin",
-        action="store_true",
-        help="Launch full admin UI with pipeline builder (default: chat-only mode)",
-    )
 
     p_show_case = show_sub.add_parser("case", help="Launch Case Study Viewer")
     p_show_case.add_argument(
@@ -2046,7 +2192,7 @@ def main() -> None:
         asyncio.run(run(args.config, args.param, is_demo=args.is_demo))
     elif args.cmd == "show":
         if args.show_target == "ui":
-            launch_ui(host=args.host, port=args.port, admin_mode=args.admin)
+            launch_ui(host=args.host, port=args.port)
         elif args.show_target == "case":
             launch_case_study(
                 config_path=args.config_path,
